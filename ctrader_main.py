@@ -621,7 +621,6 @@ Tu reçois l'alerte, tu places l'ordre toi-même sur MT5.
         print(f"✅ Prix XAU: {state.last_price} | DXY: {state.dxy_prices[-1]:.2f} | US10Y: {state.us10y:.2f}%")
 
         tick = 0
-        last_reconnect_attempt = 0.0
 
         while True:
             try:
@@ -635,11 +634,6 @@ Tu reçois l'alerte, tu places l'ordre toi-même sur MT5.
                         state.volumes = state.volumes[-500:]
 
                 tick += 1
-
-                # Tentative de reconnexion broker toutes les 60s si down
-                if not state.broker_connected and (time.time() - last_reconnect_attempt) > 60:
-                    last_reconnect_attempt = time.time()
-                    asyncio.create_task(connect_broker(http, notify_success=True, notify_failure=False))
 
                 if tick % 100 == 0:
                     state.dxy_prices.append(await get_dxy(http))
