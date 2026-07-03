@@ -180,7 +180,9 @@ def get_broker_price():
 
 async def get_xau_price_twelvedata(session):
     """Respecte le plan gratuit : un seul appel réseau toutes les
-    TWELVEDATA_MIN_GAP secondes, valeur mise en cache entre-temps."""
+    TWELVEDATA_MIN_GAP secondes, valeur mise en cache entre-temps.
+    Utilise /quote (pas /price) pour avoir un timestamp et vérifier
+    la fraîcheur réelle de la donnée."""
     if not TWELVEDATA_API_KEY:
         return None
 
@@ -190,12 +192,17 @@ async def get_xau_price_twelvedata(session):
 
     state.td_last_call = now
     try:
-        url = f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TWELVEDATA_API_KEY}"
+        url = f"https://api.twelvedata.com/quote?symbol=XAU/USD&apikey={TWELVEDATA_API_KEY}"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
             if r.status == 200:
                 data = await r.json()
-                if "price" in data:
-                    price = round(float(data["price"]), 2)
+                if "close" in data:
+                    price = round(float(data["close"]), 2)
+                    ts = data.get("timestamp")
+                    age_str = "inconnu"
+                    if ts:
+                        age_str = f"{round(time.time() - int(ts))}s"
+                    print(f"📡 TwelveData quote: symbol={data.get('symbol')} close={price} timestamp_age={age_str}")
                     state.td_last_price = price
                     return price
                 print(f"⚠️ TwelveData réponse inattendue: {data}")
