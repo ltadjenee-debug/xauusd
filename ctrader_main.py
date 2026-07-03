@@ -336,6 +336,82 @@ def detect_sweep(prices):
     if r[-2] < low and r[-1] > low+0.1: return "BULL_SWEEP"
     return None
 
+def detect_support_resistance(prices, tolerance=0.6, min_touches=2, lookback=80):
+    """Cherche des niveaux de prix touchés plusieurs fois récemment
+    (support si touché par en haut, résistance si touché par en bas).
+    Retourne le niveau le plus proche du prix actuel, avec son type."""
+    if len(prices) < lookback:
+        return None
+    window = prices[-lookback:]
+    price = prices[-1]
+
+    # Détection de swing highs/lows simples (pivot sur 3 points)
+    pivots = []
+    for i in range(2, len(window) - 2):
+        if window[i] > window[i-1] and window[i] > window[i+1] and window[i] >= window[i-2] and window[i] >= window[i+2]:
+            pivots.append(window[i])  # swing high
+        elif window[i] < window[i-1] and window[i] < window[i+1] and window[i] <= window[i-2] and window[i] <= window[i+2]:
+            pivots.append(window[i])  # swing low
+
+    if not pivots:
+        return None
+
+    # Regroupe les pivots proches en niveaux, garde ceux touchés plusieurs fois
+    pivots.sort()
+    clusters = []
+    for p in pivots:
+        if clusters and abs(p - clusters[-1]["avg"]) <= tolerance:
+            clusters[-1]["points"].append(p)
+            clusters[-1]["avg"] = sum(clusters[-1]["points"]) / len(clusters[-1]["points"])
+        else:
+            clusters.append({"points": [p], "avg": p})
+
+    strong_levels = [c["avg"] for c in clusters if len(c["points"]) >= min_touches]
+    if not strong_levels:
+        return None
+
+    nearest = min(strong_levels, key=lambda lv: abs(lv - price))
+    dist = abs(nearest - price)
+    if dist > tolerance * 2:
+        return None
+
+    return {"level": round(nearest, 2), "type": "resistance" if nearest > price else "support",
+            "distance": round(dist, 2)}
+
+def detect_trend_structure(prices, lookback=40):
+    """Structure haussière = plus hauts et plus bas croissants récents.
+    Structure baissière = plus hauts et plus bas décroissants.
+    Retourne 'BREAK_UP' si une structure baissière vient d'être cassée
+    à la hausse, 'BREAK_DOWN' si une structure haussière vient d'être
+    cassée à la baisse — sinon None."""
+    if len(prices) < lookback:
+        return None
+    window = prices[-lookback:]
+
+    pivots_idx = []
+    for i in range(2, len(window) - 2):
+        if window[i] > window[i-1] and window[i] > window[i+1]:
+            pivots_idx.append((i, window[i], "H"))
+        elif window[i] < window[i-1] and window[i] < window[i+1]:
+            pivots_idx.append((i, window[i], "L"))
+
+    highs = [p[1] for p in pivots_idx if p[2] == "H"]
+    lows  = [p[1] for p in pivots_idx if p[2] == "L"]
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+
+    was_downtrend = highs[-1] < highs[-2] and lows[-1] < lows[-2]
+    was_uptrend   = highs[-1] > highs[-2] and lows[-1] > lows[-2]
+    price = window[-1]
+    last_high = highs[-1]
+    last_low  = lows[-1]
+
+    if was_downtrend and price > last_high:
+        return "BREAK_UP"
+    if was_uptrend and price < last_low:
+        return "BREAK_DOWN"
+    return None
+
 def detect_fvg(prices):
     if len(prices) < 3: return None
     c1, _, c3 = prices[-3], prices[-2], prices[-1]
@@ -367,6 +443,8 @@ def score_signal():
     prime   = is_prime_window()
     sweep   = detect_sweep(prices)
     fvg     = detect_fvg(prices)
+    sr      = detect_support_resistance(prices)
+    trend_break = detect_trend_structure(prices)
     dxy_trend, dxy_score = analyze_dxy(state.dxy_prices)
 
     score = 0
@@ -414,6 +492,16 @@ def score_signal():
     if fvg:
         if (fvg == "BULLISH_FVG" and direction == "BUY") or (fvg == "BEARISH_FVG" and direction == "SELL"):
             score += 12; reasons.append("Fair Value Gap")
+
+    if sr:
+        if sr["type"] == "support" and direction == "BUY":
+            score += 12; reasons.append(f"Rebond support {sr['level']} 📐")
+        elif sr["type"] == "resistance" and direction == "SELL":
+            score += 12; reasons.append(f"Rebond résistance {sr['level']} 📐")
+
+    if trend_break:
+        if (trend_break == "BREAK_UP" and direction == "BUY") or (trend_break == "BREAK_DOWN" and direction == "SELL"):
+            score += 15; reasons.append("Cassure de structure 📈" if trend_break == "BREAK_UP" else "Cassure de structure 📉")
 
     if state.volumes:
         vol_ma = sum(state.volumes[-20:]) / min(20, len(state.volumes))
