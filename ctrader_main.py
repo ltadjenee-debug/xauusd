@@ -424,7 +424,6 @@ def score_signal():
     if state.consec_loss >= 3: score -= 20
 
     score = max(0, min(score, 100))
-    if score < MIN_SCORE: return None
 
     leverage, lev_label, lev_emoji = get_leverage(score)
     atr_val = max(atr, 1.5)
@@ -665,14 +664,15 @@ Tu reçois l'alerte, tu places l'ordre toi-même sur MT5.
 
                 else:
                     signal = score_signal()
-                    if signal:
+                    if signal and signal["score"] >= MIN_SCORE:
                         print(f"🚨 {signal['direction']} @ {signal['entry']} | Score: {signal['score']}/100")
                         state.in_trade = True
                         state.trade = {**signal, "open_time": time.time()}
                         await send_entry(http, signal)
                     else:
                         if tick % 200 == 0:
-                            print(f"🔍 Scan #{tick} — Pas de setup")
+                            best = signal["score"] if signal else "N/A"
+                            print(f"🔍 Scan #{tick} — Pas de setup (meilleur score actuel: {best}/100, seuil: {MIN_SCORE})")
 
                 await asyncio.sleep(SCAN_SLEEP)
 
