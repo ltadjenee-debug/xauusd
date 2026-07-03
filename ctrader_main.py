@@ -19,11 +19,13 @@ from zoneinfo import ZoneInfo
 
 logging.basicConfig(level=logging.WARNING)
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID          = "808538037"
-CTRADER_ACCOUNT  = os.environ.get("CTRADER_ACCOUNT", "")
-CTRADER_PASSWORD = os.environ.get("CTRADER_PASSWORD", "")
-CTRADER_SERVER   = "168.205.95.20"
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID             = "808538037"
+CTRADER_ACCOUNT     = os.environ.get("CTRADER_ACCOUNT", "")
+CTRADER_PASSWORD    = os.environ.get("CTRADER_PASSWORD", "")
+CTRADER_SERVER      = "168.205.95.20"
+TWELVEDATA_API_KEY  = os.environ.get("TWELVEDATA_API_KEY", "")
+TWELVEDATA_MIN_GAP  = 8.0   # secondes entre 2 appels TwelveData (respect du plan gratuit)
 
 SYMBOL       = "XAUUSD"
 LOT_SIZE     = 0.01          # taille indicative pour les messages, pas d'exécution réelle
@@ -66,6 +68,9 @@ class State:
         self.broker_connected  = False
         self.broker_last_ok    = 0.0
         self.using_fallback    = False
+        self.price_source      = "init"
+        self.td_last_call      = 0.0
+        self.td_last_price     = None
 
 state = State()
 
@@ -173,6 +178,31 @@ def get_broker_price():
 # SOURCES DE PRIX DE SECOURS (Yahoo Finance)
 # ─────────────────────────────────────────────────────────────
 
+async def get_xau_price_twelvedata(session):
+    """Respecte le plan gratuit : un seul appel réseau toutes les
+    TWELVEDATA_MIN_GAP secondes, valeur mise en cache entre-temps."""
+    if not TWELVEDATA_API_KEY:
+        return None
+
+    now = time.time()
+    if (now - state.td_last_call) < TWELVEDATA_MIN_GAP:
+        return state.td_last_price  # renvoie la valeur en cache, pas de nouvel appel
+
+    state.td_last_call = now
+    try:
+        url = f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TWELVEDATA_API_KEY}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status == 200:
+                data = await r.json()
+                if "price" in data:
+                    price = round(float(data["price"]), 2)
+                    state.td_last_price = price
+                    return price
+                print(f"⚠️ TwelveData réponse inattendue: {data}")
+    except Exception as e:
+        print(f"⚠️ TwelveData erreur: {e}")
+    return None
+
 async def get_xau_price_yahoo(session):
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
@@ -186,20 +216,30 @@ async def get_xau_price_yahoo(session):
     return None
 
 async def get_xau_price(session):
-    """Priorité au broker IC Markets ; Yahoo en secours ; jamais de prix inventé."""
+    """Ordre de priorité : broker IC Markets > TwelveData > Yahoo > dernier
+    prix connu. Jamais de prix inventé aléatoirement."""
     p = get_broker_price()
     if p is not None:
+        state.price_source = "IC Markets"
         state.using_fallback = False
+        return p
+
+    p = await get_xau_price_twelvedata(session)
+    if p is not None:
+        state.price_source = "TwelveData"
+        state.using_fallback = True
         return p
 
     p = await get_xau_price_yahoo(session)
     if p is not None:
+        state.price_source = "Yahoo"
         state.using_fallback = True
         return p
 
-    # Ni broker ni Yahoo disponibles : on NE génère PAS de prix aléatoire.
+    # Aucune source disponible : on NE génère PAS de prix aléatoire.
     # On renvoie le dernier prix connu, sans changement, pour ne pas
     # fabriquer un faux mouvement de marché.
+    state.price_source = "dernier prix connu"
     return state.last_price if state.last_price > 0 else None
 
 async def get_dxy(session):
@@ -483,7 +523,7 @@ async def send_entry(session, signal):
     arrow  = "📈" if is_buy else "📉"
     action = "ACHETER" if is_buy else "VENDRE"
     confluences = "\n".join([f"  ✓ {r}" for r in signal["reasons"][:9]])
-    src = "⚠️ Yahoo (secours)" if state.using_fallback else "✅ IC Markets"
+    src = f"{'✅' if not state.using_fallback else '⚠️'} {state.price_source}"
 
     msg = f"""{arrow} <b>SIGNAL — {action} XAUUSD</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
