@@ -627,7 +627,7 @@ Tu reçois l'alerte, tu places l'ordre toi-même sur MT5.
         while True:
             try:
                 price = await get_xau_price(http)
-                if price is not None:
+                if price is not None and price != state.last_price:
                     state.prices.append(price)
                     state.volumes.append(random.randint(60, 250))
                     state.last_price = price
