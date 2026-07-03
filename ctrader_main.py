@@ -73,12 +73,50 @@ state = State()
 # CONNEXION BROKER (IC Markets cTrader via FIX) — flux de PRIX seulement
 # ─────────────────────────────────────────────────────────────
 
+def _test_raw_socket(host, port, timeout=6):
+    """Teste si le port TCP brut est joignable, indépendamment de ejtraderCT.
+    Beaucoup de PaaS (Railway inclus) bloquent ou limitent les sockets
+    sortants sur des ports non-standards (ejtraderCT utilise 5201/5202,
+    pas le 443 HTTPS habituel)."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
 def _connect_broker_blocking():
-    """Bloquant (sockets + threads) — à lancer dans un executor."""
-    from ejtraderCT import Ctrader
-    api = Ctrader(CTRADER_SERVER, CTRADER_ACCOUNT, CTRADER_PASSWORD)
+    """Bloquant (sockets + threads) — à lancer dans un executor.
+    Retourne (api, symbol_name, diagnostic_str)."""
+    diag_lines = []
+
+    if not CTRADER_ACCOUNT or not CTRADER_PASSWORD:
+        return None, None, "Variables CTRADER_ACCOUNT et/ou CTRADER_PASSWORD absentes ou vides sur Railway."
+
+    # Test réseau bas niveau AVANT d'appeler ejtraderCT, pour distinguer
+    # un blocage réseau (Railway) d'un problème d'identifiants (broker).
+    ok_q, err_q = _test_raw_socket(CTRADER_SERVER, 5201)
+    ok_t, err_t = _test_raw_socket(CTRADER_SERVER, 5202)
+    diag_lines.append(f"Port 5201 (quote): {'OK' if ok_q else 'ÉCHEC — ' + str(err_q)}")
+    diag_lines.append(f"Port 5202 (trade): {'OK' if ok_t else 'ÉCHEC — ' + str(err_t)}")
+
+    if not ok_q or not ok_t:
+        diag_lines.append("→ Probable blocage réseau sortant côté hébergeur (Railway), pas un problème d'identifiants.")
+        return None, None, " | ".join(diag_lines)
+
+    try:
+        from ejtraderCT import Ctrader
+        api = Ctrader(CTRADER_SERVER, CTRADER_ACCOUNT, CTRADER_PASSWORD)
+    except Exception as e:
+        diag_lines.append(f"Exception ejtraderCT: {type(e).__name__}: {e}")
+        return None, None, " | ".join(diag_lines)
+
     if not api.isconnected():
-        return None, None
+        diag_lines.append("Sockets OK mais login FIX refusé — vérifie CTRADER_ACCOUNT (format live.icmarkets.XXXXXXX) et CTRADER_PASSWORD (mot de passe API cTrader, pas ton mot de passe IC Markets standard).")
+        return None, None, " | ".join(diag_lines)
 
     # Le nom exact du symbole gold dépend du broker (XAUUSD, XAUUSD.a, GOLD...).
     # On le cherche dynamiquement dans la liste de symboles renvoyée par le
@@ -86,19 +124,20 @@ def _connect_broker_blocking():
     candidates = [n for n in api.fix.sec_name_table.keys()
                   if "XAU" in n.upper() or "GOLD" in n.upper()]
     if not candidates:
-        return api, None
+        diag_lines.append(f"Connecté mais aucun symbole XAU/GOLD trouvé parmi {len(api.fix.sec_name_table)} symboles reçus.")
+        return api, None, " | ".join(diag_lines)
 
     symbol_name = candidates[0]
     api.subscribe(symbol_name)
-    return api, symbol_name
+    return api, symbol_name, "OK"
 
 async def connect_broker(http, notify=True):
     loop = asyncio.get_event_loop()
     try:
-        api, symbol_name = await loop.run_in_executor(None, _connect_broker_blocking)
+        api, symbol_name, diag = await loop.run_in_executor(None, _connect_broker_blocking)
     except Exception as e:
-        print(f"❌ Connexion broker échouée: {e}")
-        api, symbol_name = None, None
+        print(f"❌ Connexion broker échouée (exception executor): {type(e).__name__}: {e}")
+        api, symbol_name, diag = None, None, f"Exception executor: {type(e).__name__}: {e}"
 
     if api and symbol_name:
         state.broker_api       = api
@@ -110,10 +149,9 @@ async def connect_broker(http, notify=True):
             await send_telegram(http, f"✅ <b>Broker IC Markets connecté</b>\nSymbole gold : <code>{symbol_name}</code>\nPrix broker actifs (au lieu de Yahoo).")
     else:
         state.broker_connected = False
-        reason = "pas de symbole XAU/GOLD trouvé dans la liste du broker" if api else "connexion FIX impossible"
-        print(f"⚠️ Broker indisponible ({reason}) — fallback Yahoo Finance actif")
+        print(f"⚠️ Broker indisponible — DIAGNOSTIC: {diag}")
         if notify:
-            await send_telegram(http, f"⚠️ <b>Broker IC Markets indisponible</b> ({reason}).\nLe bot utilise Yahoo Finance en secours (léger décalage possible). Nouvelle tentative en arrière-plan.")
+            await send_telegram(http, f"⚠️ <b>Broker IC Markets indisponible</b>\n<code>{diag}</code>\nLe bot utilise Yahoo Finance en secours. Nouvelle tentative dans 60s.")
 
 def get_broker_price():
     """Lecture non-bloquante (dict déjà tenu à jour par les threads FIX)."""
