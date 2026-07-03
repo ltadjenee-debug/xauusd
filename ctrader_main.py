@@ -1,6 +1,10 @@
 """
-XAUUSD SCALPING BOT — cTrader IC Markets
-Connexion directe via FIX API / ejtraderCT
+XAUUSD SCALPING BOT — SIGNAL ONLY
+Analyse en continu, envoie des alertes Telegram. AUCUNE exécution
+automatique — c'est toi qui places/fermes les trades sur MT5.
+
+Prix : flux broker IC Markets (cTrader FIX) en priorité,
+       Yahoo Finance en secours si le flux broker est indisponible.
 """
 
 import os
@@ -9,18 +13,27 @@ import aiohttp
 import time
 import random
 import math
+import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID         = "808538037"
-CTRADER_ACCOUNT = os.environ.get("CTRADER_ACCOUNT", "")
+logging.basicConfig(level=logging.WARNING)
+
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID          = "808538037"
+CTRADER_ACCOUNT  = os.environ.get("CTRADER_ACCOUNT", "")
 CTRADER_PASSWORD = os.environ.get("CTRADER_PASSWORD", "")
-CTRADER_SERVER  = "168.205.95.20"
+CTRADER_SERVER   = "168.205.95.20"
 
-SYMBOL     = "XAUUSD"
-LOT_SIZE   = 0.01
-MIN_SCORE  = 78
-MAX_DUR    = 15 * 60
+SYMBOL       = "XAUUSD"
+LOT_SIZE     = 0.01          # taille indicative pour les messages, pas d'exécution réelle
+MIN_SCORE    = 78
+MAX_DUR      = 15 * 60
+SCAN_SLEEP   = 0.3           # vitesse d'analyse (avant: 1s)
+BROKER_STALE_SEC = 5         # si le prix broker n'a pas bougé depuis N sec -> considéré mort
+
+PARIS_TZ = ZoneInfo("Europe/Paris")
+PRIME_WINDOW = (4, 10)       # 4h-10h heure Paris/Londres/Berlin = fenêtre optimale scalp gold
 
 LEVERAGE_TABLE = [
     (97, 101, 5, "SETUP EN BÉTON",  "💎"),
@@ -37,22 +50,92 @@ def get_leverage(score):
 
 class State:
     def __init__(self):
-        self.in_trade   = False
-        self.trade      = None
-        self.prices     = []
-        self.volumes    = []
-        self.last_price = 0.0
-        self.dxy_prices = []
-        self.us10y      = 4.3
-        self.wins       = 0
-        self.losses     = 0
-        self.total_pnl  = 0.0
+        self.in_trade    = False   # "signal actif en cours de suivi", pas une vraie position
+        self.trade       = None
+        self.prices      = []
+        self.volumes     = []
+        self.last_price  = 0.0
+        self.dxy_prices  = []
+        self.us10y       = 4.3
+        self.wins        = 0
+        self.losses      = 0
+        self.total_pnl   = 0.0
         self.consec_loss = 0
-        self.position_id = None
+        self.broker_api        = None
+        self.broker_symbol     = None
+        self.broker_connected  = False
+        self.broker_last_ok    = 0.0
+        self.using_fallback    = False
 
 state = State()
 
-async def get_xau_price(session):
+# ─────────────────────────────────────────────────────────────
+# CONNEXION BROKER (IC Markets cTrader via FIX) — flux de PRIX seulement
+# ─────────────────────────────────────────────────────────────
+
+def _connect_broker_blocking():
+    """Bloquant (sockets + threads) — à lancer dans un executor."""
+    from ejtraderCT import Ctrader
+    api = Ctrader(CTRADER_SERVER, CTRADER_ACCOUNT, CTRADER_PASSWORD)
+    if not api.isconnected():
+        return None, None
+
+    # Le nom exact du symbole gold dépend du broker (XAUUSD, XAUUSD.a, GOLD...).
+    # On le cherche dynamiquement dans la liste de symboles renvoyée par le
+    # serveur FIX au login, au lieu de le deviner en dur.
+    candidates = [n for n in api.fix.sec_name_table.keys()
+                  if "XAU" in n.upper() or "GOLD" in n.upper()]
+    if not candidates:
+        return api, None
+
+    symbol_name = candidates[0]
+    api.subscribe(symbol_name)
+    return api, symbol_name
+
+async def connect_broker(http, notify=True):
+    loop = asyncio.get_event_loop()
+    try:
+        api, symbol_name = await loop.run_in_executor(None, _connect_broker_blocking)
+    except Exception as e:
+        print(f"❌ Connexion broker échouée: {e}")
+        api, symbol_name = None, None
+
+    if api and symbol_name:
+        state.broker_api       = api
+        state.broker_symbol    = symbol_name
+        state.broker_connected = True
+        state.broker_last_ok   = time.time()
+        print(f"✅ Broker IC Markets connecté — symbole gold détecté: {symbol_name}")
+        if notify:
+            await send_telegram(http, f"✅ <b>Broker IC Markets connecté</b>\nSymbole gold : <code>{symbol_name}</code>\nPrix broker actifs (au lieu de Yahoo).")
+    else:
+        state.broker_connected = False
+        reason = "pas de symbole XAU/GOLD trouvé dans la liste du broker" if api else "connexion FIX impossible"
+        print(f"⚠️ Broker indisponible ({reason}) — fallback Yahoo Finance actif")
+        if notify:
+            await send_telegram(http, f"⚠️ <b>Broker IC Markets indisponible</b> ({reason}).\nLe bot utilise Yahoo Finance en secours (léger décalage possible). Nouvelle tentative en arrière-plan.")
+
+def get_broker_price():
+    """Lecture non-bloquante (dict déjà tenu à jour par les threads FIX)."""
+    if not state.broker_connected or not state.broker_api or not state.broker_symbol:
+        return None
+    try:
+        q = state.broker_api.quote(state.broker_symbol)
+        if not isinstance(q, dict) or "bid" not in q or "ask" not in q:
+            return None
+        age = time.time() - (q.get("time", 0) / 1000.0)
+        if age > BROKER_STALE_SEC:
+            return None
+        bid, ask = float(q["bid"]), float(q["ask"])
+        return round((bid + ask) / 2, 2)
+    except Exception:
+        return None
+
+# ─────────────────────────────────────────────────────────────
+# SOURCES DE PRIX DE SECOURS (Yahoo Finance)
+# ─────────────────────────────────────────────────────────────
+
+async def get_xau_price_yahoo(session):
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -60,10 +143,26 @@ async def get_xau_price(session):
             if r.status == 200:
                 data = await r.json()
                 return round(float(data["chart"]["result"][0]["meta"]["regularMarketPrice"]), 2)
-    except:
+    except Exception:
         pass
-    base = state.last_price if state.last_price > 0 else 3300.0
-    return round(base + (random.random() - 0.499) * 0.6, 2)
+    return None
+
+async def get_xau_price(session):
+    """Priorité au broker IC Markets ; Yahoo en secours ; jamais de prix inventé."""
+    p = get_broker_price()
+    if p is not None:
+        state.using_fallback = False
+        return p
+
+    p = await get_xau_price_yahoo(session)
+    if p is not None:
+        state.using_fallback = True
+        return p
+
+    # Ni broker ni Yahoo disponibles : on NE génère PAS de prix aléatoire.
+    # On renvoie le dernier prix connu, sans changement, pour ne pas
+    # fabriquer un faux mouvement de marché.
+    return state.last_price if state.last_price > 0 else None
 
 async def get_dxy(session):
     try:
@@ -73,7 +172,7 @@ async def get_dxy(session):
             if r.status == 200:
                 data = await r.json()
                 return float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
-    except:
+    except Exception:
         pass
     return 101.3
 
@@ -85,9 +184,13 @@ async def get_us10y(session):
             if r.status == 200:
                 data = await r.json()
                 return float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
-    except:
+    except Exception:
         pass
     return 4.37
+
+# ─────────────────────────────────────────────────────────────
+# INDICATEURS
+# ─────────────────────────────────────────────────────────────
 
 def calc_ema(prices, period):
     if len(prices) < period:
@@ -134,11 +237,18 @@ def calc_bollinger(prices, period=20):
     return {"upper": round(mid+2*std, 2), "middle": round(mid, 2), "lower": round(mid-2*std, 2)}
 
 def detect_session():
-    h = datetime.now(timezone.utc).hour
-    if 13 <= h < 17: return {"name": "OVERLAP LDN/NY", "emoji": "🔥", "bonus": 20, "active": True}
-    elif 7 <= h < 13: return {"name": "LONDON", "emoji": "🇬🇧", "bonus": 12, "active": True}
-    elif 17 <= h < 21: return {"name": "NEW YORK", "emoji": "🗽", "bonus": 10, "active": True}
+    """Sessions de marché — calculées en heure de Paris (DST géré automatiquement)."""
+    h = datetime.now(PARIS_TZ).hour
+    if 14 <= h < 18: return {"name": "OVERLAP LDN/NY", "emoji": "🔥", "bonus": 20, "active": True}
+    elif 8 <= h < 14: return {"name": "LONDON", "emoji": "🇬🇧", "bonus": 12, "active": True}
+    elif 18 <= h < 22: return {"name": "NEW YORK", "emoji": "🗽", "bonus": 10, "active": True}
     else: return {"name": "ASIA", "emoji": "🌏", "bonus": 3, "active": True}
+
+def is_prime_window():
+    """Fenêtre optimale scalp gold : 4h-10h heure Paris/Londres/Berlin."""
+    h = datetime.now(PARIS_TZ).hour
+    lo, hi = PRIME_WINDOW
+    return lo <= h < hi
 
 def detect_sweep(prices):
     if len(prices) < 25: return None
@@ -176,6 +286,7 @@ def score_signal():
     ema50  = calc_ema(prices, 50)
     ema200 = calc_ema(prices, min(200, len(prices)))
     session = detect_session()
+    prime   = is_prime_window()
     sweep   = detect_sweep(prices)
     fvg     = detect_fvg(prices)
     dxy_trend, dxy_score = analyze_dxy(state.dxy_prices)
@@ -215,6 +326,10 @@ def score_signal():
     score += session["bonus"]
     reasons.append(f"{session['emoji']} {session['name']}")
 
+    if prime:
+        score += 10
+        reasons.append("🌟 Fenêtre optimale (4h-10h Paris)")
+
     if sweep:
         if (sweep == "BULL_SWEEP" and direction == "BUY") or (sweep == "BEAR_SWEEP" and direction == "SELL"):
             score += 20; reasons.append("Liquidity Sweep 🔥")
@@ -252,8 +367,6 @@ def score_signal():
 
     rr = round(abs(tp2 - price) / max(abs(sl - price), 0.01), 1)
 
-    # Gains réels avec IC Markets 0.01 lot XAUUSD
-    # 1 pip = 0.01 lot × 100 = 1$ (gold is quoted in $/oz, 1 pip = $0.01 × lot × 100)
     pip_value_dollar = LOT_SIZE * 100
     gain_tp2_dollar  = round(abs(tp2 - price) * pip_value_dollar, 2)
     gain_tp2_euro    = round(gain_tp2_dollar * 0.92, 2)
@@ -265,6 +378,7 @@ def score_signal():
         "rr": rr, "score": score,
         "reasons": reasons,
         "session": session,
+        "prime": prime,
         "atr": atr, "rsi": rsi,
         "dxy_trend": dxy_trend,
         "leverage": leverage, "lev_label": lev_label, "lev_emoji": lev_emoji,
@@ -275,6 +389,8 @@ def score_signal():
     }
 
 def check_exit(price):
+    """Suivi du signal en cours pour savoir quand alerter la sortie —
+    ne ferme rien réellement, c'est purement informatif."""
     if not state.trade: return None
     t = state.trade
     d = t["direction"]
@@ -307,6 +423,10 @@ def check_exit(price):
         if price <= t["tp2"]: return {"reason": "TP2 ATTEINT", "price": price, "pnl": round(t["entry"] - price, 2), "emoji": "🎯"}
     return None
 
+# ─────────────────────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────────────────────
+
 async def send_telegram(session, msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -320,41 +440,14 @@ async def send_telegram(session, msg):
         print(f"❌ Telegram: {e}")
         return False
 
-async def ctrader_open(direction, lots, sl, tp):
-    try:
-        from ejtraderCT import Ctrader
-        api = Ctrader(CTRADER_SERVER, CTRADER_ACCOUNT, CTRADER_PASSWORD)
-        await asyncio.sleep(1)
-        if not api.isconnected():
-            print("❌ cTrader non connecté")
-            return None
-        result = api.buy(SYMBOL, lots, sl=sl, tp=tp) if direction == "BUY" else api.sell(SYMBOL, lots, sl=sl, tp=tp)
-        api.disconnect()
-        print(f"✅ cTrader ordre: {result}")
-        return result
-    except Exception as e:
-        print(f"❌ cTrader open: {e}")
-        return None
-
-async def ctrader_close(position_id):
-    try:
-        from ejtraderCT import Ctrader
-        api = Ctrader(CTRADER_SERVER, CTRADER_ACCOUNT, CTRADER_PASSWORD)
-        await asyncio.sleep(0.5)
-        api.close(position_id)
-        api.disconnect()
-        return True
-    except Exception as e:
-        print(f"❌ cTrader close: {e}")
-        return False
-
-async def send_entry(session, signal, pos_id):
+async def send_entry(session, signal):
     is_buy = signal["direction"] == "BUY"
     arrow  = "📈" if is_buy else "📉"
-    action = "ACHETÉ" if is_buy else "VENDU"
-    confluences = "\n".join([f"  ✓ {r}" for r in signal["reasons"][:8]])
+    action = "ACHETER" if is_buy else "VENDRE"
+    confluences = "\n".join([f"  ✓ {r}" for r in signal["reasons"][:9]])
+    src = "⚠️ Yahoo (secours)" if state.using_fallback else "✅ IC Markets"
 
-    msg = f"""{arrow} <b>TRADE OUVERT — {action} XAUUSD</b>
+    msg = f"""{arrow} <b>SIGNAL — {action} XAUUSD</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {signal['lev_emoji']} <b>{signal['lev_label']}</b> (Score {signal['score']}/100)
 ━━━━━━━━━━━━━━━━━━━━━━━━
@@ -365,16 +458,16 @@ async def send_entry(session, signal, pos_id):
 🏆 <b>TP3 :</b> <code>{signal['tp3']}</code>
 ⚖️ <b>RR :</b> 1:{signal['rr']}
 ━━━━━━━━━━━━━━━━━━━━━━━━
-💰 <b>Lot :</b> {signal['lots']} | ~{signal['pip_value']}$/pip
+💰 <b>Lot indicatif :</b> {signal['lots']} | Levier suggéré {signal['leverage']}x
 📈 <b>Gain estimé TP2 :</b> ~+{signal['gain_tp2_dollar']}$ (~+{signal['gain_tp2_euro']}€)
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {signal['session']['emoji']} {signal['session']['name']} | DXY: {signal['dxy_trend']}
+📡 Source prix : {src}
 
 <b>Confluences :</b>
 {confluences}
 ━━━━━━━━━━━━━━━━━━━━━━━━
-🆔 Position : <code>{pos_id}</code>
-⏳ <i>Je surveille et ferme automatiquement...</i>"""
+👉 <i>À toi d'exécuter sur MT5. Je surveille et t'alerte à la sortie.</i>"""
 
     await send_telegram(session, msg)
 
@@ -389,11 +482,11 @@ async def send_exit(session, exit_info):
     win_rate   = round(state.wins / max(1, state.wins + state.losses) * 100)
 
     headers = {
-        "STOP LOSS":    "🛑 <b>STOP LOSS — TRADE FERMÉ AUTO</b>",
-        "TRAILING STOP":"🔄 <b>TRAILING STOP — TRADE FERMÉ AUTO</b>",
-        "TP3 MAX":      "🏆 <b>TP3 MAXIMUM — TRADE FERMÉ AUTO !</b>",
-        "TP2 ATTEINT":  "🎯 <b>TP2 ATTEINT — TRADE FERMÉ AUTO !</b>",
-        "TIMEOUT 15MIN":"⏰ <b>TIMEOUT — TRADE FERMÉ AUTO</b>",
+        "STOP LOSS":     "🛑 <b>NIVEAU STOP LOSS ATTEINT</b>",
+        "TRAILING STOP": "🔄 <b>TRAILING STOP ATTEINT</b>",
+        "TP3 MAX":       "🏆 <b>TP3 MAXIMUM ATTEINT !</b>",
+        "TP2 ATTEINT":   "🎯 <b>TP2 ATTEINT !</b>",
+        "TIMEOUT 15MIN": "⏰ <b>TIMEOUT 15 MIN</b>",
     }
     header = headers.get(exit_info["reason"], f"📊 <b>{exit_info['reason']}</b>")
 
@@ -401,40 +494,47 @@ async def send_exit(session, exit_info):
 ━━━━━━━━━━━━━━━━━━━━━━━━
 💱 XAUUSD {t['direction']}
 📍 Entrée : <code>{t['entry']}</code>
-📍 Sortie : <code>{exit_info['price']}</code>
-{'💰' if is_win else '📉'} P&L : <code>{'+' if is_win else ''}{pnl:.2f} pts</code> (~{'+' if is_win else '-'}{pnl_dollar}$ / {pnl_euro}€)
-⏱️ Durée : {mins}m {secs}s
+📍 Niveau atteint : <code>{exit_info['price']}</code>
+{'💰' if is_win else '📉'} P&L estimé : <code>{'+' if is_win else ''}{pnl:.2f} pts</code> (~{'+' if is_win else '-'}{pnl_dollar}$ / {pnl_euro}€)
+⏱️ Durée du suivi : {mins}m {secs}s
 ━━━━━━━━━━━━━━━━━━━━━━━━
-📊 Win Rate : {win_rate}% ({state.wins}W/{state.losses}L)
-💹 P&L Total : {'+' if state.total_pnl >= 0 else ''}{state.total_pnl:.2f} pts
+📊 Win Rate (signaux) : {win_rate}% ({state.wins}W/{state.losses}L)
+💹 P&L Total estimé : {'+' if state.total_pnl >= 0 else ''}{state.total_pnl:.2f} pts
 ━━━━━━━━━━━━━━━━━━━━━━━━
+👉 <i>Ferme ta position sur MT5 si ce n'est pas déjà fait.</i>
 🔍 <i>Prochain signal en cours d'analyse...</i>"""
 
     await send_telegram(session, msg)
 
+# ─────────────────────────────────────────────────────────────
+# BOUCLE PRINCIPALE
+# ─────────────────────────────────────────────────────────────
+
 async def main():
-    print("🚀 XAUUSD BOT — cTrader IC Markets")
+    print("🚀 XAUUSD BOT — SIGNAL ONLY (IC Markets prix + Yahoo secours)")
 
     async with aiohttp.ClientSession() as http:
 
-        await send_telegram(http, """🥇 <b>XAUUSD SCALPING BOT — IC Markets cTrader</b>
+        await send_telegram(http, f"""🥇 <b>XAUUSD SIGNAL BOT — ACTIF</b>
 
-⚡ <b>100% AUTOMATIQUE</b>
-Connexion directe IC Markets via FIX API.
+📡 <b>SIGNAL ONLY</b> — je n'exécute rien.
+Tu reçois l'alerte, tu places l'ordre toi-même sur MT5.
 
-💰 <b>Lot : 0.01</b> (~1$/pip sur XAUUSD)
-📊 Score minimum : 78/100
-⏱️ Timeout : 15 min
-🔄 Trailing Stop actif
-🎯 Gain estimé TP2 : 2-5€ par trade
+💰 <b>Lot indicatif : {LOT_SIZE}</b> (~1$/pip)
+📊 Score minimum : {MIN_SCORE}/100
+⏱️ Timeout suivi : 15 min
+🌟 Fenêtre optimale : 4h-10h (Paris/Londres/Berlin)
 
-🔍 <i>Analyse XAUUSD en cours...</i>""")
+🔍 <i>Connexion au flux de prix...</i>""")
+
+        await connect_broker(http)
 
         for _ in range(60):
             p = await get_xau_price(http)
-            state.prices.append(p)
-            state.volumes.append(random.randint(80, 200))
-            state.last_price = p
+            if p is not None:
+                state.prices.append(p)
+                state.volumes.append(random.randint(80, 200))
+                state.last_price = p
             await asyncio.sleep(0.05)
 
         for _ in range(5):
@@ -444,32 +544,37 @@ Connexion directe IC Markets via FIX API.
         print(f"✅ Prix XAU: {state.last_price} | DXY: {state.dxy_prices[-1]:.2f} | US10Y: {state.us10y:.2f}%")
 
         tick = 0
+        last_reconnect_attempt = 0.0
 
         while True:
             try:
                 price = await get_xau_price(http)
-                state.prices.append(price)
-                state.volumes.append(random.randint(60, 250))
-                state.last_price = price
-                if len(state.prices) > 500:
-                    state.prices = state.prices[-500:]
-                    state.volumes = state.volumes[-500:]
+                if price is not None:
+                    state.prices.append(price)
+                    state.volumes.append(random.randint(60, 250))
+                    state.last_price = price
+                    if len(state.prices) > 500:
+                        state.prices = state.prices[-500:]
+                        state.volumes = state.volumes[-500:]
 
                 tick += 1
 
-                if tick % 30 == 0:
+                # Tentative de reconnexion broker toutes les 60s si down
+                if not state.broker_connected and (time.time() - last_reconnect_attempt) > 60:
+                    last_reconnect_attempt = time.time()
+                    asyncio.create_task(connect_broker(http, notify=True))
+
+                if tick % 100 == 0:
                     state.dxy_prices.append(await get_dxy(http))
                     if len(state.dxy_prices) > 20:
                         state.dxy_prices = state.dxy_prices[-20:]
 
-                if tick % 60 == 0:
+                if tick % 200 == 0:
                     state.us10y = await get_us10y(http)
 
                 if state.in_trade:
                     exit_info = check_exit(price)
                     if exit_info:
-                        if state.position_id:
-                            await ctrader_close(state.position_id)
                         if exit_info["pnl"] > 0:
                             state.wins += 1; state.consec_loss = 0
                         else:
@@ -478,23 +583,20 @@ Connexion directe IC Markets via FIX API.
                         await send_exit(http, exit_info)
                         state.in_trade = False
                         state.trade = None
-                        state.position_id = None
-                        print(f"✅ Fermé: {exit_info['reason']} | PnL: {exit_info['pnl']:.2f}")
+                        print(f"✅ Signal clos: {exit_info['reason']} | PnL: {exit_info['pnl']:.2f}")
 
-                elif tick % 1 == 0:
+                else:
                     signal = score_signal()
                     if signal:
                         print(f"🚨 {signal['direction']} @ {signal['entry']} | Score: {signal['score']}/100")
-                        pos_id = await ctrader_open(signal["direction"], signal["lots"], signal["sl"], signal["tp2"])
-                        state.in_trade   = True
-                        state.position_id = pos_id
+                        state.in_trade = True
                         state.trade = {**signal, "open_time": time.time()}
-                        await send_entry(http, signal, pos_id or "N/A")
+                        await send_entry(http, signal)
                     else:
-                        if tick % 60 == 0:
+                        if tick % 200 == 0:
                             print(f"🔍 Scan #{tick} — Pas de setup")
 
-                await asyncio.sleep(1)
+                await asyncio.sleep(SCAN_SLEEP)
 
             except asyncio.CancelledError:
                 break
