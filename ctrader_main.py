@@ -136,7 +136,7 @@ def _connect_broker_blocking():
     api.subscribe(symbol_name)
     return api, symbol_name, "OK"
 
-async def connect_broker(http, notify=True):
+async def connect_broker(http, notify_success=True, notify_failure=False):
     loop = asyncio.get_event_loop()
     try:
         api, symbol_name, diag = await loop.run_in_executor(None, _connect_broker_blocking)
@@ -150,13 +150,13 @@ async def connect_broker(http, notify=True):
         state.broker_connected = True
         state.broker_last_ok   = time.time()
         print(f"✅ Broker IC Markets connecté — symbole gold détecté: {symbol_name}")
-        if notify:
-            await send_telegram(http, f"✅ <b>Broker IC Markets connecté</b>\nSymbole gold : <code>{symbol_name}</code>\nPrix broker actifs (au lieu de Yahoo).")
+        if notify_success:
+            await send_telegram(http, f"✅ <b>Broker IC Markets connecté</b>\nSymbole gold : <code>{symbol_name}</code>\nPrix broker actifs (au lieu de TwelveData/Yahoo).")
     else:
         state.broker_connected = False
         print(f"⚠️ Broker indisponible — DIAGNOSTIC: {diag}")
-        if notify:
-            await send_telegram(http, f"⚠️ <b>Broker IC Markets indisponible</b>\n<code>{diag}</code>\nLe bot utilise Yahoo Finance en secours. Nouvelle tentative dans 60s.")
+        if notify_failure:
+            await send_telegram(http, f"⚠️ <b>Broker IC Markets indisponible</b>\n<code>{diag}</code>\nLe bot utilise TwelveData/Yahoo en secours. Nouvelle tentative dans 60s.")
 
 def get_broker_price():
     """Lecture non-bloquante (dict déjà tenu à jour par les threads FIX)."""
@@ -605,7 +605,7 @@ Tu reçois l'alerte, tu places l'ordre toi-même sur MT5.
 
 🔍 <i>Connexion au flux de prix...</i>""")
 
-        await connect_broker(http)
+        await connect_broker(http, notify_success=True, notify_failure=False)
 
         for _ in range(60):
             p = await get_xau_price(http)
@@ -640,7 +640,7 @@ Tu reçois l'alerte, tu places l'ordre toi-même sur MT5.
                 # Tentative de reconnexion broker toutes les 60s si down
                 if not state.broker_connected and (time.time() - last_reconnect_attempt) > 60:
                     last_reconnect_attempt = time.time()
-                    asyncio.create_task(connect_broker(http, notify=True))
+                    asyncio.create_task(connect_broker(http, notify_success=True, notify_failure=False))
 
                 if tick % 100 == 0:
                     state.dxy_prices.append(await get_dxy(http))
